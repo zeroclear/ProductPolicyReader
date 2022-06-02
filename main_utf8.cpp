@@ -5,6 +5,8 @@
 //参考：https://www.remkoweijnen.nl/blog/2010/06/15/having-fun-with-windows-licensing/
 //无忧论坛有一些补充信息，但是软件要权限才能下载，一切都只能靠自己
 //https://bbs.pcbeta.com/viewthread-1774832-1-1.html
+//新资料：
+//https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/ex/slmem/productpolicy.htm
 
 //内核负责维护License数据，一份放在注册表里，另一份放在内存的ExpLicensingView里
 //还有一份展开的数据，放在内存的ExpLicensingDescriptors里
@@ -105,6 +107,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 		case SL_DATA_SZ:
 		case SL_DATA_MULTI_SZ:
 			{
+				//字符串长度非0时，总长度计入末尾的0，字符串长度为0时，总长度却为0
+				//可以分配出长度为0的内存，但wcscpy写入末尾的0时会出问题，必须分开处理
 				if (EntryPtr->ValueSize!=0)
 				{
 					ValueBuffer=new WCHAR[EntryPtr->ValueSize];
@@ -165,3 +169,219 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 	delete[] RegValue;
 	return 0;
 };
+
+struct EntryExpand
+{
+	ProductPolicyEntry Head;
+	WCHAR* Name;
+	BYTE* Value;
+};
+
+ProductPolicyHeader ExpandHead;
+EntryExpand* ExpandArray;
+int ExpandNumber;
+DWORD ExpandTail;
+BOOL IsExpand=FALSE;
+
+//返回所需缓冲区大小
+int PolicyCreateEmptyBlock(BYTE* Buffer)
+{
+	if (Buffer==NULL)
+		return sizeof(ProductPolicyHeader)+4;
+
+	ProductPolicyHeader* Head=(ProductPolicyHeader*)Buffer;
+	Head->TotalSize=sizeof(ProductPolicyHeader)+4;
+	Head->DataSize=0;
+	Head->CheckSize=4;
+	Head->BootFlag=0;
+	Head->HeadCheck=1;
+	DWORD* Tail=(DWORD*)(Buffer+sizeof(ProductPolicyHeader));
+	*Tail=4+0x41;
+	return Head->TotalSize;
+}
+
+//返回项数
+int PolicyExpandData(BYTE* InputData)
+{
+	//没有检测数据有效性
+	ExpandHead=*(ProductPolicyHeader*)InputData;
+	ExpandTail=*(DWORD*)(InputData+sizeof(ProductPolicyHeader)+ExpandHead.DataSize);
+
+	ExpandNumber=0;
+	int RemainSize=ExpandHead.DataSize;
+
+	ProductPolicyEntry* EntryPtr=(ProductPolicyEntry*)(InputData+sizeof(ProductPolicyHeader));
+	while (RemainSize>0)
+	{
+		RemainSize=RemainSize-EntryPtr->BlockSize;
+		EntryPtr=(ProductPolicyEntry*)((BYTE*)EntryPtr+EntryPtr->BlockSize);
+		ExpandNumber++;
+	}
+
+	ExpandArray=new EntryExpand[ExpandNumber];
+	EntryPtr=(ProductPolicyEntry*)(InputData+sizeof(ProductPolicyHeader));
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		ExpandArray[i].Head=*EntryPtr;
+
+		WCHAR* NamePtr=(WCHAR*)((BYTE*)EntryPtr+sizeof(ProductPolicyEntry));
+		ExpandArray[i].Name=new WCHAR[EntryPtr->NameSize/sizeof(WCHAR)+1];
+		memcpy(ExpandArray[i].Name,NamePtr,EntryPtr->NameSize);
+		ExpandArray[i].Name[EntryPtr->NameSize]=0;
+
+		BYTE* ValuePtr=(BYTE*)EntryPtr+sizeof(ProductPolicyEntry)+EntryPtr->NameSize;
+		ExpandArray[i].Value=new BYTE[EntryPtr->ValueSize];
+		memcpy(ExpandArray[i].Value,ValuePtr,EntryPtr->ValueSize);
+
+		EntryPtr=(ProductPolicyEntry*)((BYTE*)EntryPtr+EntryPtr->BlockSize);
+	}
+
+	IsExpand=TRUE;
+	return ExpandNumber;
+}
+
+void SelectSort(EntryExpand* ExpandArray,int ExpandNumber)
+{
+	int SortedNum=0;
+	int MinItem;
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		MinItem=SortedNum;	//UnsortedIndex=SortedNum-1+1,
+		for (int j=SortedNum;j<ExpandNumber-SortedNum;j++)
+		{
+			//从小到大排序
+			if (wcscmp(ExpandArray[j].Name,ExpandArray[MinItem].Name)<0)
+			{
+				//相比插入排序，必须扫描全部，不能break
+				MinItem=j;
+			}
+		}
+		//相比插入排序，无需向后移动元素，只要交换目标元素
+		EntryExpand Temp=ExpandArray[SortedNum];
+		ExpandArray[SortedNum]=ExpandArray[MinItem];
+		ExpandArray[MinItem]=Temp;
+		SortedNum++;
+	}
+}
+
+//返回所需缓冲区大小
+int PolicyRepackData(BYTE* Buffer)
+{
+	if (Buffer==NULL)
+		return ExpandHead.TotalSize;
+
+	SelectSort(ExpandArray,ExpandNumber);
+	memset(Buffer,0,ExpandHead.TotalSize);
+	*(ProductPolicyHeader*)Buffer=ExpandHead;
+	*(DWORD*)(Buffer+sizeof(ProductPolicyHeader)+ExpandHead.DataSize)=ExpandTail;
+
+	ProductPolicyEntry* EntryPtr=(ProductPolicyEntry*)(Buffer+sizeof(ProductPolicyHeader));
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		*EntryPtr=ExpandArray[i].Head;
+
+		WCHAR* NamePtr=(WCHAR*)((BYTE*)EntryPtr+sizeof(ProductPolicyEntry));
+		memcpy(NamePtr,ExpandArray[i].Name,ExpandArray[i].Head.NameSize);
+		delete[] ExpandArray[i].Name;
+
+		BYTE* ValuePtr=(BYTE*)EntryPtr+sizeof(ProductPolicyEntry)+EntryPtr->NameSize;
+		memcpy(ValuePtr,ExpandArray[i].Value,ExpandArray[i].Head.ValueSize);
+		delete[] ExpandArray[i].Value;
+
+		//填充字节直接空出就可以了
+
+		EntryPtr=(ProductPolicyEntry*)((BYTE*)EntryPtr+EntryPtr->BlockSize);
+	}
+	delete[] ExpandArray;
+
+	IsExpand=FALSE;
+	return ExpandHead.TotalSize;
+}
+
+//返回是否成功，重名会失败
+//注意如果类型为SL_DATA_SZ，长度需要计入末尾的0
+BOOL PolicyInsertEntry(WCHAR* Name,SLDATATYPE ValueType,int ValueSize,void* Value)
+{
+	if (!IsExpand)
+		return FALSE;
+
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		if (wcscmp(ExpandArray[i].Name,Name)==0)
+			return FALSE;
+	}
+
+	//重新分配内存复制过去，效率不高但是比较简单；内层指针不受影响
+	EntryExpand* NewExpandArray=new EntryExpand[ExpandNumber+1];
+	memcpy(NewExpandArray,ExpandArray,sizeof(EntryExpand)*ExpandNumber);
+	delete[] ExpandArray;
+	ExpandArray=NewExpandArray;
+	
+	//没检查参数正确性，比如Name长度不能为0
+	ExpandArray[ExpandNumber].Head.Zero=0;
+	ExpandArray[ExpandNumber].Head.NotifyFlag=0;
+	ExpandArray[ExpandNumber].Head.NameSize=wcslen(Name)*sizeof(WCHAR);
+	ExpandArray[ExpandNumber].Head.ValueType=ValueType;
+	ExpandArray[ExpandNumber].Head.ValueSize=ValueSize;
+	ExpandArray[ExpandNumber].Head.BlockSize=sizeof(ProductPolicyEntry)+ExpandArray[ExpandNumber].Head.NameSize+
+		ExpandArray[ExpandNumber].Head.ValueSize;
+	//每一项都对齐到4字节，则总的数据也一定对齐到4字节
+	int PadSize=4-ExpandArray[ExpandNumber].Head.BlockSize%4;
+	ExpandArray[ExpandNumber].Head.BlockSize+=PadSize;
+
+	ExpandArray[ExpandNumber].Name=new WCHAR[wcslen(Name)+1];
+	wcscpy(ExpandArray[ExpandNumber].Name,Name);
+
+	ExpandArray[ExpandNumber].Value=new BYTE[ValueSize];
+	memcpy(ExpandArray[ExpandNumber].Value,Value,ValueSize);
+
+	ExpandNumber++;
+	return TRUE;
+}
+
+//返回是否成功，不存在会失败
+BOOL PolicyDeleteEntry(WCHAR* Name)
+{
+	if (!IsExpand)
+		return FALSE;
+
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		if (wcscmp(ExpandArray[i].Name,Name)==0)
+		{
+			delete[] ExpandArray[i].Name;
+			delete[] ExpandArray[i].Value;
+			//打包时再排序，这里不用管顺序
+			ExpandArray[i]=ExpandArray[ExpandNumber-1];
+			ExpandNumber--;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+//返回是否成功，不存在会失败，重名但类型不同也会失败
+BOOL PolicyModifyEntry(WCHAR* Name,SLDATATYPE ValueType,int ValueSize,void* Value)
+{
+	if (!IsExpand)
+		return FALSE;
+
+	for (int i=0;i<ExpandNumber;i++)
+	{
+		if (wcscmp(ExpandArray[i].Name,Name)==0)
+		{
+			if (ExpandArray[i].Head.ValueType!=ValueType)
+				return FALSE;
+
+			delete[] ExpandArray[i].Value;	
+			ExpandArray[i].Head.ValueSize=ValueSize;
+			ExpandArray[i].Head.BlockSize=sizeof(ProductPolicyEntry)+ExpandArray[i].Head.NameSize+
+				ExpandArray[i].Head.ValueSize;
+			int PadSize=4-ExpandArray[i].Head.BlockSize%4;
+			ExpandArray[i].Head.BlockSize+=PadSize;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
