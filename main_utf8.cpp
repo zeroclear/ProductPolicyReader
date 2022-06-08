@@ -59,7 +59,7 @@ struct ProductPolicyEntry
 
 int HexByteToText(BYTE b,WCHAR* Text)
 {
-	BYTE bh=(b&0xF0)>>8;
+	BYTE bh=(b&0xF0)>>4;
 	BYTE bl=b&0x0F;
 	if (bh<10)
 		Text[0]=bh+'0';
