@@ -5,7 +5,7 @@
 //参考：https://www.remkoweijnen.nl/blog/2010/06/15/having-fun-with-windows-licensing/
 //无忧论坛有一些补充信息，但是软件要权限才能下载，一切都只能靠自己
 //https://bbs.pcbeta.com/viewthread-1774832-1-1.html
-//新资料：
+//新资料：（里面ExUpdateLicenseData参数是反的，太坑了）
 //https://www.geoffchappell.com/studies/windows/km/ntoskrnl/api/ex/slmem/productpolicy.htm
 
 //内核负责维护License数据，一份放在注册表里，另一份放在内存的ExpLicensingView里
